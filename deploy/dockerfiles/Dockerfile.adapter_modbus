@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/adapter-modbus ./cmd/adapter-modbus
+
+FROM alpine:3.20
+WORKDIR /app
+COPY --from=build /out/adapter-modbus ./adapter-modbus
+ENV MQTT_URL=tcp://mqtt:1883
+ENV DEVICE_ID=cw100.inverter
+ENTRYPOINT ["./adapter-modbus"]
