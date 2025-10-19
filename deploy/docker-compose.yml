@@ -1,0 +1,38 @@
+version: "3.8"
+services:
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: smh-mosquitto
+    ports: ["1883:1883"]
+  core:
+    build:
+      context: ..
+      dockerfile: deploy/dockerfiles/Dockerfile.core
+    image: smh-core:local
+    container_name: smh-core
+    environment: [ "MQTT_URL=tcp://mqtt:1883" ]
+    depends_on: [ mqtt ]
+  adapter_modbus:
+    build:
+      context: ..
+      dockerfile: deploy/dockerfiles/Dockerfile.adapter_modbus
+    image: smh-adapter-modbus:local
+    container_name: smh-adapter-modbus
+    environment:
+      - MQTT_URL=tcp://mqtt:1883
+      - DEVICE_ID=cw100.inverter
+      - MODEL=CW100
+      - AREA=lab
+      - MODBUS_MODE=rtu
+      - MODBUS_PORT=/dev/ttyUSB0
+      - MODBUS_BAUD=9600
+      - MODBUS_DATABITS=8
+      - MODBUS_PARITY=N
+      - MODBUS_STOPBITS=1
+      - MODBUS_SLAVE_ID=1
+      - MODBUS_TIMEOUT_MS=500
+      - INTERVAL_SEC=1
+    # for RTU via host USB (Linux):
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+    depends_on: [ mqtt, core ]
