@@ -1,47 +1,102 @@
 package main
 
 import (
-	"encoding/json"
-	"time"
+	"github.com/tetragramaton/smh-go/internal/interface/modbus"
+	"log"
+
+	//"encoding/json"
+	mqttIface "github.com/tetragramaton/smh-go/internal/interface/mqtt"
 )
 
-// MQTTPublisher is a minimal interface for tests and real MQTT client.
-type MQTTPublisher interface {
-	Publish(topic string, payload []byte, qos byte, retain bool) error
+// mqttClient is a minimal interface for tests and real MQTT client.
+type mqttClient interface {
+	mqttIface.API
 }
 
 // PublishOnce reads mapped registers and publishes normalized states once.
-// Used by tests; main loop uses similar logic on a ticker.
-func PublishOnce(h handler, client MQTTPublisher, cfg envCfg, now int64) {
+// Used by tests; the main loop uses similar logic on a ticker.
+func PublishOnce(h MainHandler, cfg envCfg, now int64) {
 	// frequency
-	if v, err := h.readFloat(cfg.MapCfg.Frequency.Addr, cfg.MapCfg.Frequency.Scale, cfg.MapCfg.Frequency.Holding); err == nil {
-		state := map[string]interface{}{"ts": now, "cap": "sensor.frequency", "value": round(v, 2), "unit": "Hz"}
-		client.Publish("smh/"+cfg.DeviceID+"/state", must(json.Marshal(state)), 1, false)
+	freqParam := modbus.RegisterParam{
+		Addr:    cfg.MapCfg.Frequency.Addr,
+		Scale:   cfg.MapCfg.Frequency.Scale,
+		Holding: cfg.MapCfg.Frequency.Holding,
+	}
+	const path = "/state"
+	if v, err := h.readFloat(freqParam); err == nil {
+		sensorState := SensorState{
+			Ts:    now,
+			Cap:   "sensor.frequency",
+			Unit:  "Hz",
+			Value: round(v, 2),
+		}
+		err := h.publishEvent(cfg, sensorState, path)
+		if err != nil {
+			log.Printf("Error publishing sensor state: %v", err)
+		}
 	}
 	// voltage
-	if v, err := h.readFloat(cfg.MapCfg.Voltage.Addr, cfg.MapCfg.Voltage.Scale, cfg.MapCfg.Voltage.Holding); err == nil {
-		state := map[string]interface{}{"ts": now, "cap": "sensor.voltage", "value": round(v, 1), "unit": "V"}
-		client.Publish("smh/"+cfg.DeviceID+"/state", must(json.Marshal(state)), 1, false)
+	voltParam := modbus.RegisterParam{
+		Addr:    cfg.MapCfg.Voltage.Addr,
+		Scale:   cfg.MapCfg.Voltage.Scale,
+		Holding: cfg.MapCfg.Voltage.Holding,
+	}
+	if v, err := h.readFloat(voltParam); err == nil {
+		sensorState := SensorState{
+			Ts:    now,
+			Cap:   "sensor.voltage",
+			Unit:  "V",
+			Value: round(v, 1),
+		}
+		err := h.publishEvent(cfg, sensorState, path)
+		if err != nil {
+			log.Printf("Error publishing sensor state: %v", err)
+		}
 	}
 	// energy.meter (optional fields if mapped)
-	payload := map[string]interface{}{"ts": now, "cap": "energy.meter"}
+	var pwPtr, ekPtr *float64
 	ok := false
-	if cfg.MapCfg.Power.Addr != 0 {
-		if v, err := h.readFloat(cfg.MapCfg.Power.Addr, cfg.MapCfg.Power.Scale, cfg.MapCfg.Power.Holding); err == nil {
-			payload["power_w"] = round(v, 1)
-			ok = true
-		}
-	}
-	if cfg.MapCfg.Energy.Addr != 0 {
-		if v, err := h.readFloat(cfg.MapCfg.Energy.Addr, cfg.MapCfg.Energy.Scale, cfg.MapCfg.Energy.Holding); err == nil {
-			payload["energy_kwh"] = round(v, 6)
-			ok = true
-		}
-	}
-	if ok {
-		client.Publish("smh/"+cfg.DeviceID+"/state", must(json.Marshal(payload)), 1, false)
-	}
-}
 
-// helper for tests to fabricate "now"
-func nowUnix() int64 { return time.Now().Unix() }
+	if cfg.MapCfg.Power.Addr != 0 {
+		p := modbus.RegisterParam{
+			Addr:    cfg.MapCfg.Power.Addr,
+			Scale:   cfg.MapCfg.Power.Scale,
+			Holding: cfg.MapCfg.Power.Holding,
+		}
+		if v, err := h.readFloat(p); err == nil {
+			pw := round(v, 1)
+			pwPtr = pw
+			ok = true
+		} else {
+			log.Printf("read power: %v", err)
+		}
+	}
+
+	if cfg.MapCfg.Energy.Addr != 0 {
+		p := modbus.RegisterParam{
+			Addr:    cfg.MapCfg.Energy.Addr,
+			Scale:   cfg.MapCfg.Energy.Scale,
+			Holding: cfg.MapCfg.Energy.Holding,
+		}
+		if v, err := h.readFloat(p); err == nil {
+			ek := round(v, 6)
+			ekPtr = ek
+			ok = true
+		} else {
+			log.Printf("read energy: %v", err)
+		}
+	}
+
+	if ok {
+		state := SensorState{
+			Ts:        now,
+			Cap:       "energy.meter",
+			PowerW:    pwPtr,
+			EnergyKwh: ekPtr,
+		}
+		if err := h.publishEvent(cfg, state, path); err != nil {
+			log.Printf("publish state: %v", err)
+		}
+	}
+
+}

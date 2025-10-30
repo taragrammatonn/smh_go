@@ -3,15 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/tetragramaton/smh-go/internal/interface/modbus"
+	mqttIface "github.com/tetragramaton/smh-go/internal/interface/mqtt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	//"github.com/eclipse/paho.mqtt.golang"
-	"github.com/goburrow/modbus"
-	mqtt "github.com/tetragramaton/smh-go/internal/mqtt"
 )
 
 type Meta struct {
@@ -45,13 +43,26 @@ type RegMap struct {
 	} `json:"energy"`
 }
 
+type SensorState struct {
+	Ts        int64    `json:"ts"`
+	Cap       string   `json:"cap"`
+	Unit      string   `json:"unit,omitempty"`
+	Value     *float64 `json:"value,omitempty"`
+	PowerW    *float64 `json:"power_w,omitempty"`
+	EnergyKwh *float64 `json:"energy_kwh,omitempty"`
+}
+
 func main() {
-	cfg := loadEnv()
-	client, err := mqtt.New(mqtt.Config{BrokerURL: cfg.MQTTURL, ClientID: "adapter-modbus-" + time.Now().Format("150405")})
+	handler, err := InitMainHandler()
 	if err != nil {
-		log.Fatalf("mqtt: %v", err)
+		log.Fatal(err)
 	}
-	defer client.Close()
+	handler.Handle()
+}
+
+func (h *MainHandler) Handle() {
+	cfg := loadEnv()
+	defer h.MQQTClient.Disconnect(250)
 
 	// announce meta
 	meta := Meta{
@@ -60,15 +71,16 @@ func main() {
 		Area:     cfg.Area,
 		Caps:     []string{"sensor.frequency", "sensor.voltage", "energy.meter"},
 	}
-	if err := client.Publish("smh/"+cfg.DeviceID+"/meta", must(json.Marshal(meta)), 1, false); err != nil {
+	if err := h.publishEvent(cfg, meta, "/meta"); err != nil {
 		log.Printf("meta publish: %v", err)
 	}
 
-	handler, err := newHandler(cfg)
-	if err != nil {
-		log.Fatalf("modbus handler: %v", err)
-	}
-	defer handler.Close()
+	defer func(ModbusClient modbus.Client) {
+		err := ModbusClient.Close()
+		if err != nil {
+			log.Printf("modbus client close: %v", err)
+		}
+	}(h.ModbusClient)
 
 	ticker := time.NewTicker(time.Duration(cfg.IntervalSec) * time.Second)
 	defer ticker.Stop()
@@ -77,113 +89,112 @@ func main() {
 		select {
 		case <-ticker.C:
 			now := time.Now().Unix()
+			const statePath = "/state"
+			const errorLog = "publish event error: %v"
 
-			if v, err := handler.readFloat(cfg.MapCfg.Frequency.Addr, cfg.MapCfg.Frequency.Scale, cfg.MapCfg.Frequency.Holding); err == nil {
-				state := map[string]interface{}{"ts": now, "cap": "sensor.frequency", "value": round(v, 2), "unit": "Hz"}
-				client.Publish("smh/"+cfg.DeviceID+"/state", must(json.Marshal(state)), 1, false)
+			// frequency
+			freqParam := modbus.RegisterParam{
+				Addr:    cfg.MapCfg.Frequency.Addr,
+				Scale:   cfg.MapCfg.Frequency.Scale,
+				Holding: cfg.MapCfg.Frequency.Holding,
+			}
+			if v, err := h.readFloat(freqParam); err == nil {
+				state := SensorState{
+					Ts:    now,
+					Cap:   "sensor.frequency",
+					Value: round(v, 2),
+					Unit:  "Hz",
+				}
+				if err := h.publishEvent(cfg, state, statePath); err != nil {
+					log.Printf(errorLog, err)
+				}
 			} else {
 				log.Printf("read frequency: %v", err)
 			}
-			if v, err := handler.readFloat(cfg.MapCfg.Voltage.Addr, cfg.MapCfg.Voltage.Scale, cfg.MapCfg.Voltage.Holding); err == nil {
-				state := map[string]interface{}{"ts": now, "cap": "sensor.voltage", "value": round(v, 1), "unit": "V"}
-				client.Publish("smh/"+cfg.DeviceID+"/state", must(json.Marshal(state)), 1, false)
+
+			// voltage
+			voltParam := modbus.RegisterParam{
+				Addr:    cfg.MapCfg.Voltage.Addr,
+				Scale:   cfg.MapCfg.Voltage.Scale,
+				Holding: cfg.MapCfg.Voltage.Holding,
+			}
+			if v, err := h.readFloat(voltParam); err == nil {
+				state := SensorState{
+					Ts:    now,
+					Cap:   "sensor.voltage",
+					Value: round(v, 1),
+					Unit:  "V",
+				}
+				if err := h.publishEvent(cfg, state, statePath); err != nil {
+					log.Printf(errorLog, err)
+				}
 			} else {
 				log.Printf("read voltage: %v", err)
 			}
-			// Power + Energy (optional)
-			var powerW, energyKwh *float64
+
+			// power + energy (optional)
+			var pwPtr, ekPtr *float64
+			ok := false
+
 			if cfg.MapCfg.Power.Addr != 0 {
-				if v, err := handler.readFloat(cfg.MapCfg.Power.Addr, cfg.MapCfg.Power.Scale, cfg.MapCfg.Power.Holding); err == nil {
-					powerW = &v
+				p := modbus.RegisterParam{
+					Addr:    cfg.MapCfg.Power.Addr,
+					Scale:   cfg.MapCfg.Power.Scale,
+					Holding: cfg.MapCfg.Power.Holding,
+				}
+				if v, err := h.readFloat(p); err == nil {
+					pwPtr = round(v, 1)
+					ok = true
+				} else {
+					log.Printf("read power: %v", err)
 				}
 			}
+
 			if cfg.MapCfg.Energy.Addr != 0 {
-				if v, err := handler.readFloat(cfg.MapCfg.Energy.Addr, cfg.MapCfg.Energy.Scale, cfg.MapCfg.Energy.Holding); err == nil {
-					energyKwh = &v
+				p := modbus.RegisterParam{
+					Addr:    cfg.MapCfg.Energy.Addr,
+					Scale:   cfg.MapCfg.Energy.Scale,
+					Holding: cfg.MapCfg.Energy.Holding,
+				}
+				if v, err := h.readFloat(p); err == nil {
+					ekPtr = round(v, 6)
+					ok = true
+				} else {
+					log.Printf("read energy: %v", err)
 				}
 			}
-			if powerW != nil || energyKwh != nil {
-				payload := map[string]interface{}{"ts": now, "cap": "energy.meter"}
-				if powerW != nil {
-					payload["power_w"] = round(*powerW, 1)
+
+			if ok {
+				state := SensorState{
+					Ts:        now,
+					Cap:       "energy.meter",
+					PowerW:    pwPtr,
+					EnergyKwh: ekPtr,
 				}
-				if energyKwh != nil {
-					payload["energy_kwh"] = round(*energyKwh, 6)
+				if err := h.publishEvent(cfg, state, statePath); err != nil {
+					log.Printf(errorLog, err)
 				}
-				client.Publish("smh/"+cfg.DeviceID+"/state", must(json.Marshal(payload)), 1, false)
 			}
 		}
 	}
 }
 
-type handler interface {
-	readFloat(addr uint16, scale float64, holding bool) (float64, error)
-	Close() error
-}
-
-type rtuHandler struct{ client modbus.Client }
-type tcpHandler struct{ client modbus.Client }
-
-func newHandler(cfg envCfg) (handler, error) {
-	if strings.ToLower(cfg.Mode) == "tcp" {
-		h := &tcpHandler{client: modbus.TCPClient(fmt.Sprintf("%s", cfg.TCPAddr))}
-		// warmup read with timeout by wrapping in handler
-		return h, nil
-	}
-	// RTU
-	// goburrow uses environment via serial.Config pushed into RTUClientHandler;
-	rtu := modbus.NewRTUClientHandler(cfg.Port)
-	rtu.BaudRate = cfg.Baud
-	rtu.DataBits = cfg.DataBits
-	rtu.Parity = cfg.Parity
-	rtu.StopBits = cfg.StopBits
-	rtu.SlaveId = byte(cfg.SlaveID)
-	rtu.Timeout = time.Duration(cfg.TimeoutMs) * time.Millisecond
-	if err := rtu.Connect(); err != nil {
-		return nil, err
-	}
-	return &rtuHandler{client: modbus.NewClient(rtu)}, nil
-}
-
-func (h *rtuHandler) readFloat(addr uint16, scale float64, holding bool) (float64, error) {
-	var res []byte
-	var err error
-	if holding {
-		res, err = h.client.ReadHoldingRegisters(addr, 1)
-	} else {
-		res, err = h.client.ReadInputRegisters(addr, 1)
-	}
+func (h *MainHandler) publishEvent(cfg envCfg, payload any, path string) error {
+	data, err := json.Marshal(payload)
 	if err != nil {
-		return 0, err
+		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
-	// 16-bit register
-	if len(res) < 2 {
-		return 0, fmt.Errorf("short response")
-	}
-	raw := uint16(res[0])<<8 | uint16(res[1])
-	return float64(int16(raw)) / scale, nil
+	return h.MQQTClient.PublishEvent(mqttIface.Message{
+		Topic:   "smh/" + cfg.DeviceID + path,
+		Payload: data,
+		QoS:     1,
+		Retain:  false,
+	})
 }
 
-func (h *rtuHandler) Close() error { return nil }
-
-func (h *tcpHandler) readFloat(addr uint16, scale float64, holding bool) (float64, error) {
-	var res []byte
-	var err error
-	if holding {
-		res, err = h.client.ReadHoldingRegisters(addr, 1)
-	} else {
-		res, err = h.client.ReadInputRegisters(addr, 1)
-	}
-	if err != nil {
-		return 0, err
-	}
-	if len(res) < 2 {
-		return 0, fmt.Errorf("short response")
-	}
-	raw := uint16(res[0])<<8 | uint16(res[1])
-	return float64(int16(raw)) / scale, nil
+func (h *MainHandler) readFloat(p modbus.RegisterParam) (float64, error) {
+	return h.ModbusClient.ReadFloat(p)
 }
-func (h *tcpHandler) Close() error { return nil }
 
 type envCfg struct {
 	MQTTURL  string
@@ -297,10 +308,11 @@ func must(b []byte, err error) []byte {
 	return b
 }
 
-func round(v float64, prec int) float64 {
+func round(v float64, prec int) *float64 {
 	p := 1.0
 	for i := 0; i < prec; i++ {
 		p *= 10
 	}
-	return float64(int(v*p+0.5)) / p
+	r := float64(int(v*p+0.5)) / p
+	return &r
 }
